@@ -201,7 +201,14 @@ const handler = async (req: Request): Promise<Response> => {
 
       const token = authHeader.split(" ")[1];
 
-      const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+      let user = null;
+      let authError = null;
+
+      // All tokens must be validated against Supabase — no mock bypass.
+      const authRes = await supabase.auth.getUser(token);
+      user = authRes.data.user;
+      authError = authRes.error;
+
       if (authError || !user) {
         failedRequests++;
         return createErrorResponse("INVALID_SESSION", "Active user session is invalid or has expired.", correlationId, 401);
@@ -210,24 +217,73 @@ const handler = async (req: Request): Promise<Response> => {
       userId = user.id;
 
       let bodyText = "";
+      let userTier = "free";
+      let skillSlug = "brainstorm";
+      let modelName = "claude-sonnet-4-6";
+      let estInput = 2000;
+      let estOutput = 1000;
+
       if (req.method === "POST") {
         bodyText = await req.clone().text();
         const payload = bodyText ? JSON.parse(bodyText) : {};
-        const skillSlug = payload.skill_slug || payload.workflow_slug || "brainstorm";
+        skillSlug = payload.skill_slug || payload.workflow_slug || "brainstorm";
+        modelName = payload.model_override || "claude-sonnet-4-6";
+        if (modelName === "career-os-gpt" || modelName === "gpt-4o") modelName = "gpt-4o";
+        else if (modelName === "career-os-claude" || modelName === "claude-sonnet-4-6") modelName = "claude-sonnet-4-6";
+        else if (modelName === "gpt-4o-mini") modelName = "gpt-4o-mini";
+        else if (modelName === "claude-haiku-4-5") modelName = "claude-haiku-4-5";
 
-        // CREDIT GATING
-        const { data: debitResult, error: debitError } = await supabase.rpc("debit_credits", {
+        // 1. Fetch user subscription tier
+        const { data: subData } = await supabase
+          .from("user_subscription")
+          .select("tier_slug")
+          .eq("user_id", userId)
+          .single();
+        if (subData?.tier_slug) {
+          userTier = subData.tier_slug;
+        }
+
+        // 2. Fetch expected tokens estimates
+        const { data: estData } = await supabase
+          .from("skill_token_estimates")
+          .select("avg_input_tokens, avg_output_tokens")
+          .eq("skill_slug", skillSlug)
+          .single();
+        if (estData) {
+          estInput = estData.avg_input_tokens || 2000;
+          estOutput = estData.avg_output_tokens || 1000;
+        }
+
+        // 3. Pre-flight quota check
+        const { data: checkResult, error: checkError } = await supabase.rpc("check_token_quota", {
           p_user_id: userId,
-          p_skill_name: skillSlug,
-          p_model: payload.model_override || "career-os-gpt",
-          p_tokens_used: 100,
-          p_metadata: { source: "gateway-proxy", correlationId }
+          p_user_tier: userTier,
+          p_skill_slug: skillSlug,
+          p_model: modelName,
+          p_input_tokens: estInput,
+          p_output_tokens: estOutput
         });
 
-        if (debitError || !debitResult || !debitResult.success) {
+        if (checkError || !checkResult || !checkResult.success) {
           failedRequests++;
-          return createErrorResponse("INSUFFICIENT_CREDITS", debitError?.message || debitResult?.error || "Insufficient balance.", correlationId, 402);
+          const reason = checkResult?.reason || "insufficient_quota";
+          return createErrorResponse("INSUFFICIENT_QUOTA", `Quota check failed: ${reason}`, correlationId, 402);
         }
+      }
+
+      let modifiedBodyText = bodyText;
+      if (req.method === "POST" && userId) {
+        try {
+          const payload = JSON.parse(bodyText);
+          payload.user_id = userId;
+          if (payload.prompt && !payload.prompt_payload) {
+            payload.prompt_payload = payload.prompt;
+          }
+          if (payload.inputs?.query && !payload.prompt_payload) {
+            payload.prompt_payload = payload.inputs.query;
+          }
+          modifiedBodyText = JSON.stringify(payload);
+        } catch (_) {}
       }
 
       const agentUrl = `${AGENT_SERVICE_URL}${url.pathname}${url.search}`;
@@ -239,10 +295,21 @@ const handler = async (req: Request): Promise<Response> => {
           "X-Correlation-ID": correlationId,
           "X-Request-ID": requestId,
         },
-        body: req.method === "GET" ? undefined : (bodyText || undefined),
+        body: req.method === "GET" ? undefined : (modifiedBodyText || undefined),
       });
 
       if (response.headers.get("Content-Type")?.includes("text/event-stream")) {
+        // Run actual consume_token_quota with estimate for streams on successful initiation
+        if (req.method === "POST" && userId && response.ok) {
+          await supabase.rpc("consume_token_quota", {
+            p_user_id: userId,
+            p_user_tier: userTier,
+            p_skill_slug: skillSlug,
+            p_model: modelName,
+            p_input_tokens: estInput,
+            p_output_tokens: estOutput
+          });
+        }
         return new Response(response.body, {
           status: 200,
           headers: {
@@ -258,6 +325,28 @@ const handler = async (req: Request): Promise<Response> => {
       }
 
       const responseText = await response.text();
+
+      // Post-flight actual usage debit for non-streaming
+      if (req.method === "POST" && userId && response.ok) {
+        let actualInput = estInput;
+        let actualOutput = estOutput;
+        try {
+          const responseJson = JSON.parse(responseText);
+          if (responseJson.usage) {
+            actualInput = responseJson.usage.prompt_tokens || estInput;
+            actualOutput = responseJson.usage.completion_tokens || estOutput;
+          }
+        } catch (_) {}
+
+        await supabase.rpc("consume_token_quota", {
+          p_user_id: userId,
+          p_user_tier: userTier,
+          p_skill_slug: skillSlug,
+          p_model: modelName,
+          p_input_tokens: actualInput,
+          p_output_tokens: actualOutput
+        });
+      }
 
       // Return the standardized payload from backend directly
       return new Response(responseText, {
